@@ -54,7 +54,8 @@ Each folder snapshots a working `solution.py` + its `submission.csv`:
 | v2      | Variance-weighted loss + EMA (worse — kept for reference)                    | 0.663     | -                   |
 | v3      | 5-seed Transformer ensemble                                                  | 0.741     | -                   |
 | v4      | Heterogeneous ensemble (5 Transformer + 3 BiLSTM)                            | 0.790     | 0.6765              |
-| v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer, Colab A100)   | **0.8355**| *pending*           |
+| v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer, Colab A100)   | 0.8355    | *pending*           |
+| v6      | v5 + emb-dropout + mixup + 2 TCN seeds + 4x TTA                              | 0.8153    | *pending*           |
 
 The val→test gap of ~0.11 points across v1 and v4 comes from the two
 station pairs in test (`H → F`, `I → A`) that never appear in training —
@@ -76,6 +77,27 @@ Per-variable MSE:   temp 3.41    dewpoint 3.96    wind_speed 1.05
 Per-seed anom-norm val MSE: 1337=0.1378  2024=0.1352  4242=0.1308
                             777=0.1350  31337=0.1398  2718=0.1351
 ```
+
+### v6 breakdown (Colab, 6 BiLSTM + 2 TCN seeds)
+
+```
+Val MSE raw:  3.5345
+Val nRMSE:    0.1847
+Val score:    0.8153
+
+Per-variable MSE:   temp 4.32    dewpoint 4.87    wind_speed 1.41
+Per-seed anom-norm val MSE:
+  lstm 1337=0.1476  2024=0.1479  4242=0.1517
+  lstm  777=0.1444 31337=0.1504  2718=0.1455
+  tcn  1337=0.2512  4242=0.2537
+```
+
+Observations: v6's per-LSTM val regressed from ~0.135 -> ~0.148 (emb-dropout
++ mixup hurt the on-distribution val), and the two TCN seeds at ~0.25 dilute
+the ensemble. Whether v6 actually beats v5 on the Shipd test set depends on
+whether the added regularisation closed the unseen-pair gap more than it
+hurt in-distribution accuracy — a question the leaderboard answers, not
+our pair-stratified val.
 
 The ~10-point val→test gap on v1 highlighted the two unseen station pairs as
 the dominant failure mode, which is what v5's climate-anomaly decomposition
