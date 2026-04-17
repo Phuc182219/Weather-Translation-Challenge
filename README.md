@@ -48,13 +48,22 @@ denormalisation.
 
 Each folder snapshots a working `solution.py` + its `submission.csv`:
 
-| Version | Description                                                                  | Val score | Test score |
-|:-------:|:-----------------------------------------------------------------------------|:---------:|:----------:|
-| v1      | Single 4-layer Transformer with separate src/tgt station embeddings          | 0.706     | 0.60       |
-| v2      | Variance-weighted loss + EMA (worse — kept for reference)                    | 0.663     | -          |
-| v3      | 5-seed Transformer ensemble                                                  | 0.741     | -          |
-| v4      | Heterogeneous ensemble (5 Transformer + 3 BiLSTM)                            | 0.790     | -          |
-| v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer, Colab A100)   | **0.8355**| -          |
+| Version | Description                                                                  | Val score | Shipd test (upload) |
+|:-------:|:-----------------------------------------------------------------------------|:---------:|:-------------------:|
+| v1      | Single 4-layer Transformer with separate src/tgt station embeddings          | 0.706     | 0.6032              |
+| v2      | Variance-weighted loss + EMA (worse — kept for reference)                    | 0.663     | -                   |
+| v3      | 5-seed Transformer ensemble                                                  | 0.741     | -                   |
+| v4      | Heterogeneous ensemble (5 Transformer + 3 BiLSTM)                            | 0.790     | 0.6765              |
+| v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer, Colab A100)   | **0.8355**| *pending*           |
+
+The val→test gap of ~0.11 points across v1 and v4 comes from the two
+station pairs in test (`H → F`, `I → A`) that never appear in training —
+they account for ~14% of test samples and our validation split, stratified
+over *seen* pairs only, cannot see them. v5 is the first version that
+explicitly factors out the per-station climate offset so the learned
+transformation is only responsible for the anomaly-to-anomaly mapping,
+which should generalise across pairs much better than a pair-embedding
+lookup.
 
 ### v5 breakdown (Colab, all 6 seeds)
 
