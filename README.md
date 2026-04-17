@@ -55,7 +55,7 @@ Each folder snapshots a working `solution.py` + its `submission.csv`:
 | v3      | 5-seed Transformer ensemble                                                  | 0.741     | -                   |
 | v4      | Heterogeneous ensemble (5 Transformer + 3 BiLSTM)                            | 0.790     | 0.6765              |
 | v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer, Colab A100)   | 0.8355    | 0.7281              |
-| v6      | v5 + emb-dropout + mixup + 2 TCN seeds + 4x TTA                              | 0.8153    | *pending*           |
+| v6      | v5 + emb-dropout + mixup + 2 TCN seeds + 4x TTA                              | 0.8153    | 0.7092              |
 | v7      | 6 v5-style LSTMs + 4 coupled-pair-dropout LSTMs (p=0.3 and 0.5)              | *pending* | *pending*           |
 
 The val→test gap of ~0.11 points across v1 and v4 comes from the two

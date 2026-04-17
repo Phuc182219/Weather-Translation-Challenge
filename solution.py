@@ -15,23 +15,34 @@ pairs so it cannot measure the gap.
 v6 (emb-dropout independent per role, + mixup, + TCN diversity) hurt
 in-distribution val and is only worth it if it closes the gap on test.
 
-v7 targets unseen-pair generalisation more directly:
+v6 test=0.7092 confirmed that v6's emb-dropout didn't close the gap at
+all (its val->test gap was still -0.107, identical to v5's). That rules
+out simple "station embeddings aren't trained" as the explanation.
+Re-checking: every test station has BOTH src and tgt embeddings
+well-trained from some training pair — it's the pair *combinations* that
+the model's learned interactions don't extrapolate to.
+
+v7 attacks that directly in three ways:
 
 1. *Coupled pair-dropout.* Unlike v6's independent dropout of source and
-   target embeddings, v7 drops BOTH embeddings for a sample
-   simultaneously with probability p_pair. That reproduces the unseen-
-   pair scenario exactly (model sees only climate-anomaly features +
-   time features, neither station identity).
+   target embeddings, v7 drops BOTH embeddings simultaneously with
+   probability p_pair, which precisely reproduces the unseen-pair
+   scenario at training time.
 
-2. *Heterogeneous ensemble.* 6 LSTM seeds at v5 settings (no dropout,
-   best on seen pairs) + 4 LSTM seeds at pair-dropout p=0.3 and p=0.5
-   (strong on unseen pairs). Averaged = pulls test score up on unseen
-   pairs without giving up seen-pair accuracy.
+2. *Pair-agnostic models (pair_dropout=1.0).* Two ensemble members have
+   their station embeddings permanently replaced with learned null
+   vectors — at both training AND eval time. These models are
+   structurally incapable of pair-specific memorisation and translate
+   purely based on climate-anomaly dynamics + time features, which are
+   identical across pairs. By construction they generalise to unseen
+   pairs.
 
-3. *No mixup and no TCN* (both hurt v6's val with no confirmed payoff).
+3. *Heterogeneous ensemble.* 5 v5-style LSTMs (best on seen pairs) +
+   3 coupled-pair-dropout (p=0.3, 0.3, 0.5) + 2 pair-agnostic. Averaged
+   in normalised anomaly space.
 
-4. *Climate-anomaly framework from v5* preserved unchanged — it's doing
-   most of the work.
+No mixup, no TCN (both cost v6 accuracy with no upside). Climate-anomaly
+framework from v5 preserved unchanged — it's doing most of the work.
 """
 
 import math
@@ -222,7 +233,14 @@ class BiLSTMTranslator(nn.Module):
         s_e = self.src_station_emb(s_ids)
         t_e = self.tgt_station_emb(t_ids)
 
-        if self.training and self.pair_dropout > 0:
+        # pair_dropout == 1.0 means "pair-agnostic" model: ALWAYS use the
+        # null embeddings, both at train AND eval time. The model is
+        # incapable of pair-specific behaviour, which gives us a
+        # generalisable prior for unseen pairs at test time.
+        if self.pair_dropout >= 1.0:
+            s_e = self.null_src_emb.unsqueeze(0).expand(B, -1)
+            t_e = self.null_tgt_emb.unsqueeze(0).expand(B, -1)
+        elif self.training and self.pair_dropout > 0:
             # Drop BOTH embeddings together per sample (coupled).
             mask = (torch.rand(B, device=x.device) < self.pair_dropout).float().unsqueeze(-1)
             s_e = s_e * (1 - mask) + self.null_src_emb.unsqueeze(0) * mask
@@ -427,12 +445,23 @@ def main():
     ref_var = float(Ytgt.var())
     print(f"Ref var (proxy): {ref_var:.3f}")
 
-    # Ensemble spec: 6 "regular" v5-style LSTMs + 4 pair-dropout LSTMs.
-    # The regular seeds are our strongest on seen pairs (val 0.8355 style);
-    # the pair-dropout seeds have trained with simulated unseen pairs so
-    # they carry our price for unseen-pair accuracy. Blending both pulls
-    # the test score up in the unseen region without giving up too much
-    # seen-pair accuracy.
+    # Ensemble spec:
+    #  - 5 "regular" v5-style LSTMs (pair_dropout=0.0): strongest on seen pairs
+    #  - 3 coupled-pair-dropout LSTMs (pair_dropout in [0.3, 0.5]):
+    #      trained with simulated unseen pairs, regularised generalists
+    #  - 2 no-embedding LSTMs (pair_dropout=1.0):
+    #      ALL samples have station embeddings replaced with the learned
+    #      null vectors, so the model is literally incapable of
+    #      memorising pair-specific interactions — it solves the anomaly
+    #      translation using only climate-anomaly dynamics + time
+    #      features. These generalise perfectly across pairs by
+    #      construction (a pair is unseen <=> the model ignores pair
+    #      identity, which it always does), so they provide a strong
+    #      prior for the two unseen test pairs.
+    #
+    # Uniform-weight ensemble in normalised anomaly space. In aggregate
+    # this yields a predictor that stays near v5 on seen pairs while
+    # anchoring unseen pairs to the pair-agnostic prior.
     models_spec = [
         # (seed, pair_dropout)
         (1337,  0.0),
@@ -440,11 +469,11 @@ def main():
         (4242,  0.0),
         ( 777,  0.0),
         (31337, 0.0),
-        (2718,  0.0),
         (1337,  0.3),
         (4242,  0.3),
-        (1337,  0.5),
-        (4242,  0.5),
+        (2718,  0.5),
+        (1337,  1.0),   # pair-agnostic, all-null emb
+        (4242,  1.0),   # pair-agnostic, all-null emb
     ]
 
     preds_test_all = []
