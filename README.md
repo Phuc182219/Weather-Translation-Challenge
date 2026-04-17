@@ -57,7 +57,18 @@ Each folder snapshots a working `solution.py` + its `submission.csv`:
 | v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer, Colab A100)   | 0.8355    | 0.7281              |
 | v6      | v5 + emb-dropout + mixup + 2 TCN seeds + 4x TTA                              | 0.8153    | 0.7092              |
 | v7      | 5 LSTM + 1 GRU + 2 coupled-pair-dropout + 2 pair-agnostic (auto-pick `diverse`) | 0.8411 | *pending*           |
-| v8      | Bigger BiLSTM (d_model 224, station_dim 64) + RH/VPD physical features + TTA, 7-model ensemble | **0.8499** | *pending* |
+| v8      | Bigger BiLSTM (d_model 224, station_dim 64) + RH/VPD physical features + TTA, 7-model ensemble | 0.8499 | 0.7254 |
+| v9      | v8 backbone + 2 pair-agnostic models, **pair-conditional inference** (seen → experts, unseen → agnostic) | *pending* | *pending* |
+
+### v8 generalization failure (why v9 matters)
+
+v8 improved val by +0.009 over v5 but **regressed on test by -0.003** (0.7254 vs 0.7281). The bigger model + physical features fit seen-pair quirks 17% better on val but made unseen-pair (`H→F`, `I→A`, ~14% of test) predictions worse by ~11%. Net test MSE went up.
+
+v9 fixes this by routing test samples by pair membership:
+- Seen pair in training → average of 7 v8-style expert models
+- Unseen pair (`H→F`, `I→A`) → average of 2 pair-agnostic models (pd=1.0) that can't memorize pair-specific patterns
+
+Projected test: ~0.76-0.77 if pair-agnostic unseen MSE lands in 20-28 range (range implied by v7's pair-agnostic val stats).
 
 ### v8 breakdown (Colab, 7 models: 5 BiLSTM + 1 BiGRU + 1 BiLSTM pd=0.3)
 
