@@ -56,7 +56,8 @@ Each folder snapshots a working `solution.py` + its `submission.csv`:
 | v4      | Heterogeneous ensemble (5 Transformer + 3 BiLSTM)                            | 0.790     | 0.6765              |
 | v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer, Colab A100)   | 0.8355    | 0.7281              |
 | v6      | v5 + emb-dropout + mixup + 2 TCN seeds + 4x TTA                              | 0.8153    | 0.7092              |
-| v7      | 6 v5-style LSTMs + 4 coupled-pair-dropout LSTMs (p=0.3 and 0.5)              | *pending* | *pending*           |
+| v7      | 5 LSTM + 1 GRU + 2 coupled-pair-dropout + 2 pair-agnostic (auto-pick `diverse`) | 0.8411 | *pending*           |
+| v8      | Bigger BiLSTM (d_model 224, station_dim 64) + RH/VPD physical features + TTA, 7-model ensemble | *pending* | *pending* |
 
 The val→test gap of ~0.11 points across v1 and v4 comes from the two
 station pairs in test (`H → F`, `I → A`) that never appear in training —
