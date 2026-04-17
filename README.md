@@ -57,7 +57,29 @@ Each folder snapshots a working `solution.py` + its `submission.csv`:
 | v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer, Colab A100)   | 0.8355    | 0.7281              |
 | v6      | v5 + emb-dropout + mixup + 2 TCN seeds + 4x TTA                              | 0.8153    | 0.7092              |
 | v7      | 5 LSTM + 1 GRU + 2 coupled-pair-dropout + 2 pair-agnostic (auto-pick `diverse`) | 0.8411 | *pending*           |
-| v8      | Bigger BiLSTM (d_model 224, station_dim 64) + RH/VPD physical features + TTA, 7-model ensemble | *pending* | *pending* |
+| v8      | Bigger BiLSTM (d_model 224, station_dim 64) + RH/VPD physical features + TTA, 7-model ensemble | **0.8499** | *pending* |
+
+### v8 breakdown (Colab, 7 models: 5 BiLSTM + 1 BiGRU + 1 BiLSTM pd=0.3)
+
+```
+Val MSE raw:  2.3343
+Val nRMSE:    0.1501
+Val score:    0.8499          (+0.009 over v7 'diverse')
+
+Per-variable MSE:   temp 2.87    dewpoint 3.34    wind_speed 0.79
+Per-seed anom-norm val MSE (all ~15% lower than v7):
+  lstm 1337 pd=0.0 = 0.1040   (v7: 0.1244)
+  lstm 2024 pd=0.0 = 0.1043   (v7: 0.1255)
+  lstm 4242 pd=0.0 = 0.1054   (v7: 0.1250)
+  lstm  777 pd=0.0 = 0.1060   (v7: 0.1256)
+  lstm 31337 pd=0.0 = 0.1066  (v7: 0.1256)
+  gru  2718 pd=0.0 = 0.1227   (v7: 0.1399)
+  lstm 1337 pd=0.3 = 0.1194   (v7: 0.1408)
+```
+
+Projected Shipd test score (using v5's val→test gap of 0.107):
+~0.743 → projected rank 2 (clears ahmed_salah7's 0.7354, still ~0.022
+below jigyasu's 0.7649).
 
 The val→test gap of ~0.11 points across v1 and v4 comes from the two
 station pairs in test (`H → F`, `I → A`) that never appear in training —
