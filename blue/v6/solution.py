@@ -1,33 +1,5 @@
 """
 Weather Translation Challenge - Solution (v6)
-
-Sequence-to-sequence translation of 72-hour weather observations between
-weather stations, trained from scratch.
-
-v6 builds on v5's climate-anomaly BiLSTM and adds techniques aimed at the
-two unseen test station pairs (H->F, I->A) that cost us ~0.11 val->test
-score on previous versions:
-
-1. *Station-embedding dropout.* During training, with probability p the
-   source or target station embedding is replaced by a learned "null"
-   embedding. This forces the network to rely on the climate-anomaly
-   features (which every station has in its own history) rather than
-   memorising pair-specific transforms, so the model behaves more
-   similarly on unseen pairs at test time.
-
-2. *Within-pair mixup.* Two training samples from the same (source,
-   target) pair are linearly interpolated with lambda ~ Beta(0.4, 0.4).
-   Free regularisation that broadens the learned anomaly transformation.
-
-3. *Heterogeneous ensemble.* Six BiLSTM seeds with different embedding
-   dropouts and mixup intensities + two dilated-TCN seeds for
-   architectural diversity.
-
-4. *Test-time augmentation.* Each model is evaluated multiple times at
-   test time with emb-dropout enabled, averaged.
-
-Everything else is inherited from v5: climate-mean centering, global
-anomaly-std normalisation, residual prediction, per-pair stratified val.
 """
 
 import math
