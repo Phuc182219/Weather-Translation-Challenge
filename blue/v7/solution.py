@@ -532,19 +532,23 @@ def main():
     for rnn_type, seed, pd_, bv in val_best_list:
         print(f"  [{rnn_type} seed={seed} pd={pd_}] {bv:.4f}")
 
-    # ---- Build several named subset ensembles and report val score for
-    # each. The platform auto-picks the HIGHEST public-score submission
-    # to represent us on the private leaderboard — so we ship the subset
-    # with the best val (the proxy for public) and accept that extra
-    # robustness in lower-val subsets is effectively wasted unless it
-    # also helps public.
+    # ---- Evaluate candidate subset ensembles on val.
+    # Shipd grades by Script Run: it runs this script and scores whatever
+    # is at working/submission.csv when the script exits. We only get to
+    # submit ONE file, so we need to pick the subset most likely to score
+    # highest on public (highest public auto-represents us on private).
+    #
+    # Strategy: compute val score for each subset, pick the best on val,
+    # with a robustness tiebreaker — if two subsets tie within 0.002 val,
+    # prefer the one with more models / architectural diversity. That
+    # biases us toward a slightly more robust predictor when val can't
+    # tell the subsets apart, which is insurance for the public/private
+    # split.
     limits = {"temp": (-45.0, 55.0), "dewpoint": (-50.0, 35.0), "wind_speed": (0.0, 35.0)}
-    idx = {(rt, seed, pd_): i for i, (rt, seed, pd_) in enumerate(
-        [(a, b, c) for (a, b, c, _bv) in val_best_list]
-    )}
+    key_to_idx = {(rt, seed, pd_): i for i, (rt, seed, pd_, _bv) in enumerate(val_best_list)}
 
-    def build_sub(name, member_keys):
-        ii = [idx[k] for k in member_keys if k in idx]
+    def build_sub(member_keys):
+        ii = [key_to_idx[k] for k in member_keys if k in key_to_idx]
         if not ii:
             return None
         pt_n = np.mean([preds_test_all[i] for i in ii], axis=0)
@@ -560,10 +564,13 @@ def main():
         score_ = max(0.0, 1.0 - nrmse_)
         per_var = [float(((pv[..., vi] - Yv[..., vi]) ** 2).mean()) for vi in range(N_VARS)]
         return {
-            "name": name, "pt": pt, "mse": mse_, "nrmse": nrmse_, "score": score_,
+            "pt": pt, "mse": mse_, "nrmse": nrmse_, "score": score_,
             "per_var": per_var, "n_models": len(ii),
         }
 
+    # Subsets listed in ORDER of increasing robustness. Ties broken toward
+    # the later (more robust) subset.
+    subset_order = ["core", "diverse", "regularized", "robust"]
     subsets = {
         "core":        [("lstm", s, 0.0) for s in (1337, 2024, 4242, 777, 31337)],
         "diverse":     [("lstm", s, 0.0) for s in (1337, 2024, 4242, 777, 31337)]
@@ -577,8 +584,8 @@ def main():
                         ("lstm", 1337, 1.0), ("lstm", 4242, 1.0)],
     }
     results = {}
-    for name, keys in subsets.items():
-        r = build_sub(name, keys)
+    for name in subset_order:
+        r = build_sub(subsets[name])
         if r is None:
             continue
         results[name] = r
@@ -589,21 +596,22 @@ def main():
         for vi, v in enumerate(VARS):
             print(f"    {v}: MSE = {r['per_var'][vi]:.4f}")
 
-    # Write a separate submission for each subset so the user can pick.
-    for name, r in results.items():
-        path = os.path.join(OUT_DIR, f"submission_{name}.csv")
-        write_submission(test_df, r["pt"], path)
+    # Pick best val with robustness tiebreaker.
+    # Iterate in order of increasing robustness; a subset "wins" if its
+    # val score is within TIEBREAK of the current best. That naturally
+    # selects the most-robust subset among those tied at the top.
+    TIEBREAK = 0.002
+    best_name = subset_order[0]
+    for name in subset_order:
+        if name not in results:
+            continue
+        if results[name]["score"] >= results[best_name]["score"] - TIEBREAK:
+            best_name = name
 
-    # The "default" submission.csv is the subset with the best val score —
-    # since the platform auto-picks the highest public-score submission,
-    # we default to our best val-score predictor.
-    best_name = max(results, key=lambda k: results[k]["score"])
-    print(f"\n===== Recommended submission: '{best_name}' (best val score) =====")
+    print(f"\n===== Selected submission: '{best_name}' "
+          f"(val score {results[best_name]['score']:.4f}, "
+          f"{results[best_name]['n_models']} models) =====")
     write_submission(test_df, results[best_name]["pt"], OUT_PATH)
-    print(
-        "(Also written as submission_{core,diverse,regularized,robust}.csv in "
-        f"{OUT_DIR}/ so you can submit alternative subsets too.)"
-    )
 
 
 if __name__ == "__main__":
