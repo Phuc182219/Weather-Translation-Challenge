@@ -1,26 +1,33 @@
 """
-Weather Translation Challenge - Solution (v5)
+Weather Translation Challenge - Solution (v6)
 
 Sequence-to-sequence translation of 72-hour weather observations between
 weather stations, trained from scratch.
 
-Key ideas
----------
-1. *Per-station climate centering.* Each station has a learned "climate mean"
-   per variable (computed from training data). Before the model sees a
-   sample we subtract the source station's climate from the source series
-   and, at inference, we add the target station's climate to the output.
-   This factorises the prediction into a climate offset (handled exactly
-   via the station's own history) and a station-pair specific anomaly
-   transformation (learned by the network). It substantially helps the
-   model generalise to the two station pairs present only in the test set.
+v6 builds on v5's climate-anomaly BiLSTM and adds techniques aimed at the
+two unseen test station pairs (H->F, I->A) that cost us ~0.11 val->test
+score on previous versions:
 
-2. *Heterogeneous ensemble for diversity.* Six BiLSTM models and two
-   Transformer models are trained with different random seeds. Predictions
-   are averaged in normalised-anomaly space.
+1. *Station-embedding dropout.* During training, with probability p the
+   source or target station embedding is replaced by a learned "null"
+   embedding. This forces the network to rely on the climate-anomaly
+   features (which every station has in its own history) rather than
+   memorising pair-specific transforms, so the model behaves more
+   similarly on unseen pairs at test time.
 
-3. *Residual decoder.* Each model outputs a delta added to the normalised
-   source anomaly, so the identity map is an easy starting point.
+2. *Within-pair mixup.* Two training samples from the same (source,
+   target) pair are linearly interpolated with lambda ~ Beta(0.4, 0.4).
+   Free regularisation that broadens the learned anomaly transformation.
+
+3. *Heterogeneous ensemble.* Six BiLSTM seeds with different embedding
+   dropouts and mixup intensities + two dilated-TCN seeds for
+   architectural diversity.
+
+4. *Test-time augmentation.* Each model is evaluated multiple times at
+   test time with emb-dropout enabled, averaged.
+
+Everything else is inherited from v5: climate-mean centering, global
+anomaly-std normalisation, residual prediction, per-pair stratified val.
 """
 
 import math
@@ -88,12 +95,11 @@ def stations_list(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
 
 def compute_station_climate(train_df: pd.DataFrame, stn_to_id: dict):
-    """Return (n_stations, N_VARS) array of climate means."""
     n = len(stn_to_id)
     sums = np.zeros((n, N_VARS), dtype=np.float64)
     counts = np.zeros((n, N_VARS), dtype=np.float64)
 
-    Xsrc = reshape_wide_to_series(train_df, "source")  # (N, T, V)
+    Xsrc = reshape_wide_to_series(train_df, "source")
     Xtgt = reshape_wide_to_series(train_df, "target")
     s_ids = np.array([stn_to_id[s] for s in train_df["source_city"]])
     t_ids = np.array([stn_to_id[s] for s in train_df["target_city"]])
@@ -106,17 +112,14 @@ def compute_station_climate(train_df: pd.DataFrame, stn_to_id: dict):
         counts[tid] += T
 
     counts = np.clip(counts, 1, None)
-    climate = (sums / counts).astype(np.float32)
-    return climate
+    return (sums / counts).astype(np.float32)
 
 
 def compute_anomaly_std(train_df: pd.DataFrame, stn_to_id: dict, climate: np.ndarray):
-    """Global std of (value - station_climate) over all training observations."""
     Xsrc = reshape_wide_to_series(train_df, "source")
     Xtgt = reshape_wide_to_series(train_df, "target")
     s_ids = np.array([stn_to_id[s] for s in train_df["source_city"]])
     t_ids = np.array([stn_to_id[s] for s in train_df["target_city"]])
-
     anom_src = Xsrc - climate[s_ids][:, None, :]
     anom_tgt = Xtgt - climate[t_ids][:, None, :]
     combined = np.concatenate([anom_src, anom_tgt], axis=0).reshape(-1, N_VARS)
@@ -124,17 +127,20 @@ def compute_anomaly_std(train_df: pd.DataFrame, stn_to_id: dict, climate: np.nda
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset (supports within-pair mixup)
 # ---------------------------------------------------------------------------
 class AnomalyDataset(Dataset):
-    """Source/target values stored as *anomalies* from station climate,
-    divided by the global anomaly std."""
-
     def __init__(self, src_anom_n, tgt_anom_n, s_ids, t_ids):
         self.src = src_anom_n
         self.tgt = tgt_anom_n
         self.s_ids = s_ids
         self.t_ids = t_ids
+        # Build per-pair index lookup for mixup partners
+        self.pair_idx = {}
+        if src_anom_n is not None:
+            keys = list(zip(s_ids.tolist(), t_ids.tolist()))
+            for i, k in enumerate(keys):
+                self.pair_idx.setdefault(k, []).append(i)
 
     def __len__(self):
         return len(self.src)
@@ -147,7 +153,17 @@ class AnomalyDataset(Dataset):
             torch.from_numpy(ty),
             int(self.s_ids[idx]),
             int(self.t_ids[idx]),
+            idx,
         )
+
+    def mixup_partner(self, idx):
+        """Return an index of another sample with the same (source, target) pair."""
+        key = (int(self.s_ids[idx]), int(self.t_ids[idx]))
+        pool = self.pair_idx.get(key, [idx])
+        if len(pool) <= 1:
+            return idx
+        j = pool[np.random.randint(len(pool))]
+        return j
 
 
 # ---------------------------------------------------------------------------
@@ -167,50 +183,27 @@ def sinusoidal_time_feats(T: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Transformer model
-# ---------------------------------------------------------------------------
-class TransformerTranslator(nn.Module):
-    def __init__(self, n_stations, d_model=160, n_heads=8, n_layers=4, ff=384,
-                 dropout=0.1, station_dim=32):
-        super().__init__()
-        self.src_station_emb = nn.Embedding(n_stations, station_dim)
-        self.tgt_station_emb = nn.Embedding(n_stations, station_dim)
-
-        in_feats = N_VARS + 4 + 2 * station_dim
-        self.input_proj = nn.Linear(in_feats, d_model)
-        self.pos_emb = nn.Parameter(torch.zeros(1, T, d_model))
-        nn.init.trunc_normal_(self.pos_emb, std=0.02)
-
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=ff, dropout=dropout,
-            batch_first=True, activation="gelu", norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, N_VARS)
-        self.register_buffer("time_feats", sinusoidal_time_feats(T))
-
-    def forward(self, x, s_ids, t_ids):
-        B = x.size(0)
-        s_e = self.src_station_emb(s_ids)
-        t_e = self.tgt_station_emb(t_ids)
-        station_feat = torch.cat([s_e, t_e], dim=-1).unsqueeze(1).expand(-1, T, -1)
-        tf = self.time_feats.unsqueeze(0).expand(B, -1, -1)
-        tokens = torch.cat([x, tf, station_feat], dim=-1)
-        h = self.input_proj(tokens) + self.pos_emb
-        h = self.encoder(h)
-        h = self.norm(h)
-        return self.head(h)
-
-
-# ---------------------------------------------------------------------------
-# BiLSTM model
+# BiLSTM model with station-embedding dropout
 # ---------------------------------------------------------------------------
 class BiLSTMTranslator(nn.Module):
-    def __init__(self, n_stations, d_model=192, n_layers=3, dropout=0.2, station_dim=48):
+    def __init__(
+        self,
+        n_stations,
+        d_model=192,
+        n_layers=3,
+        dropout=0.2,
+        station_dim=48,
+        emb_dropout=0.1,
+    ):
         super().__init__()
         self.src_station_emb = nn.Embedding(n_stations, station_dim)
         self.tgt_station_emb = nn.Embedding(n_stations, station_dim)
+        # Learned "null" embedding used during station-emb dropout + TTA.
+        self.null_src_emb = nn.Parameter(torch.zeros(station_dim))
+        self.null_tgt_emb = nn.Parameter(torch.zeros(station_dim))
+        nn.init.trunc_normal_(self.null_src_emb, std=0.02)
+        nn.init.trunc_normal_(self.null_tgt_emb, std=0.02)
+        self.emb_dropout = emb_dropout
 
         in_feats = N_VARS + 4 + 2 * station_dim
         self.input_proj = nn.Linear(in_feats, d_model)
@@ -229,10 +222,24 @@ class BiLSTMTranslator(nn.Module):
         )
         self.register_buffer("time_feats", sinusoidal_time_feats(T))
 
-    def forward(self, x, s_ids, t_ids):
+    def forward(self, x, s_ids, t_ids, force_emb_drop=None):
+        """force_emb_drop: if set, overrides training-time dropout probability
+        (used for TTA at inference to apply the null embedding a controlled
+        fraction of the time)."""
         B = x.size(0)
         s_e = self.src_station_emb(s_ids)
         t_e = self.tgt_station_emb(t_ids)
+
+        drop_p = force_emb_drop if force_emb_drop is not None else (
+            self.emb_dropout if self.training else 0.0
+        )
+        if drop_p > 0:
+            # Sample independent dropout mask per sample per role.
+            m_s = (torch.rand(B, device=x.device) < drop_p).float().unsqueeze(-1)
+            m_t = (torch.rand(B, device=x.device) < drop_p).float().unsqueeze(-1)
+            s_e = s_e * (1 - m_s) + self.null_src_emb.unsqueeze(0) * m_s
+            t_e = t_e * (1 - m_t) + self.null_tgt_emb.unsqueeze(0) * m_t
+
         station_feat = torch.cat([s_e, t_e], dim=-1).unsqueeze(1).expand(-1, T, -1)
         tf = self.time_feats.unsqueeze(0).expand(B, -1, -1)
         tokens = torch.cat([x, tf, station_feat], dim=-1)
@@ -240,6 +247,78 @@ class BiLSTMTranslator(nn.Module):
         h, _ = self.rnn(h)
         h = self.norm(h)
         return self.head(h)
+
+
+# ---------------------------------------------------------------------------
+# Dilated TCN model (for ensemble diversity)
+# ---------------------------------------------------------------------------
+class TemporalBlock(nn.Module):
+    def __init__(self, c_in, c_out, k, dilation, dropout):
+        super().__init__()
+        pad = (k - 1) * dilation // 2  # centred padding for a non-causal 1D conv
+        self.conv1 = nn.Conv1d(c_in, c_out, k, padding=pad, dilation=dilation)
+        self.conv2 = nn.Conv1d(c_out, c_out, k, padding=pad, dilation=dilation)
+        self.act = nn.GELU()
+        self.do = nn.Dropout(dropout)
+        self.norm1 = nn.GroupNorm(8, c_out)
+        self.norm2 = nn.GroupNorm(8, c_out)
+        self.skip = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
+
+    def forward(self, x):
+        y = self.conv1(x)
+        y = self.norm1(y)
+        y = self.act(y)
+        y = self.do(y)
+        y = self.conv2(y)
+        y = self.norm2(y)
+        y = self.act(y)
+        y = self.do(y)
+        return y + self.skip(x)
+
+
+class TCNTranslator(nn.Module):
+    def __init__(self, n_stations, d_model=160, n_blocks=4, k=5, dropout=0.15,
+                 station_dim=48, emb_dropout=0.1):
+        super().__init__()
+        self.src_station_emb = nn.Embedding(n_stations, station_dim)
+        self.tgt_station_emb = nn.Embedding(n_stations, station_dim)
+        self.null_src_emb = nn.Parameter(torch.zeros(station_dim))
+        self.null_tgt_emb = nn.Parameter(torch.zeros(station_dim))
+        nn.init.trunc_normal_(self.null_src_emb, std=0.02)
+        nn.init.trunc_normal_(self.null_tgt_emb, std=0.02)
+        self.emb_dropout = emb_dropout
+
+        in_feats = N_VARS + 4 + 2 * station_dim
+        self.input_proj = nn.Conv1d(in_feats, d_model, 1)
+
+        blocks = []
+        for i in range(n_blocks):
+            blocks.append(TemporalBlock(d_model, d_model, k, 2 ** i, dropout))
+        self.blocks = nn.Sequential(*blocks)
+        self.head = nn.Conv1d(d_model, N_VARS, 1)
+        self.register_buffer("time_feats", sinusoidal_time_feats(T))
+
+    def forward(self, x, s_ids, t_ids, force_emb_drop=None):
+        B = x.size(0)
+        s_e = self.src_station_emb(s_ids)
+        t_e = self.tgt_station_emb(t_ids)
+        drop_p = force_emb_drop if force_emb_drop is not None else (
+            self.emb_dropout if self.training else 0.0
+        )
+        if drop_p > 0:
+            m_s = (torch.rand(B, device=x.device) < drop_p).float().unsqueeze(-1)
+            m_t = (torch.rand(B, device=x.device) < drop_p).float().unsqueeze(-1)
+            s_e = s_e * (1 - m_s) + self.null_src_emb.unsqueeze(0) * m_s
+            t_e = t_e * (1 - m_t) + self.null_tgt_emb.unsqueeze(0) * m_t
+
+        station_feat = torch.cat([s_e, t_e], dim=-1).unsqueeze(1).expand(-1, T, -1)
+        tf = self.time_feats.unsqueeze(0).expand(B, -1, -1)
+        tokens = torch.cat([x, tf, station_feat], dim=-1)  # (B, T, F)
+        tokens = tokens.transpose(1, 2)  # (B, F, T) for Conv1d
+        h = self.input_proj(tokens)
+        h = self.blocks(h)
+        out = self.head(h)  # (B, V, T)
+        return out.transpose(1, 2)  # (B, T, V)
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +331,9 @@ def train_one(
     val_ds,
     test_ds,
     n_stations,
-    epochs=100,
+    epochs=120,
+    mixup_alpha=0.4,
+    emb_dropout=0.1,
 ):
     set_seed(seed)
     BATCH = 128
@@ -260,16 +341,17 @@ def train_one(
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=0) if val_ds is not None else None
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
 
-    if arch == "tfm":
-        model = TransformerTranslator(n_stations=n_stations).to(DEVICE)
-        LR = 3e-3
-    elif arch == "lstm":
-        model = BiLSTMTranslator(n_stations=n_stations).to(DEVICE)
+    if arch == "lstm":
+        model = BiLSTMTranslator(n_stations=n_stations, emb_dropout=emb_dropout).to(DEVICE)
         LR = 2e-3
+    elif arch == "tcn":
+        model = TCNTranslator(n_stations=n_stations, emb_dropout=emb_dropout).to(DEVICE)
+        LR = 2.5e-3
     else:
         raise ValueError(arch)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[{arch} seed={seed}] Model params: {n_params:,}", flush=True)
+    print(f"[{arch} seed={seed} drop={emb_dropout} mix={mixup_alpha}] "
+          f"Model params: {n_params:,}", flush=True)
 
     WD = 1e-4
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
@@ -293,14 +375,30 @@ def train_one(
         model.train()
         tr_loss = 0.0
         tr_n = 0
-        for sx, ty, s_id, t_id in train_loader:
+        for sx, ty, s_id, t_id, idx in train_loader:
             sx, ty = sx.to(DEVICE), ty.to(DEVICE)
             s_id, t_id = s_id.to(DEVICE), t_id.to(DEVICE)
+
+            # Within-pair mixup: pair each sample with another sample from
+            # the same (source, target) pair and blend.
+            if mixup_alpha > 0 and random.random() < 0.5:
+                # Sample lambda per-sample from Beta(alpha, alpha)
+                lam = np.random.beta(mixup_alpha, mixup_alpha, size=sx.size(0)).astype(np.float32)
+                lam = np.maximum(lam, 1 - lam)  # keep lam in [0.5, 1] (standard mixup trick)
+                partner_idx = np.array(
+                    [train_ds.mixup_partner(int(i)) for i in idx.numpy()], dtype=np.int64
+                )
+                sx2 = torch.from_numpy(train_ds.src[partner_idx]).to(DEVICE)
+                ty2 = torch.from_numpy(train_ds.tgt[partner_idx]).to(DEVICE)
+                lam_t = torch.from_numpy(lam).to(DEVICE).view(-1, 1, 1)
+                sx = sx * lam_t + sx2 * (1 - lam_t)
+                ty = ty * lam_t + ty2 * (1 - lam_t)
+
             for g in opt.param_groups:
                 g["lr"] = LR * lr_at(step)
 
             delta = model(sx, s_id, t_id)
-            pred = sx + delta  # residual in normalised anomaly space
+            pred = sx + delta
             loss = F.mse_loss(pred, ty, reduction="mean")
 
             opt.zero_grad(set_to_none=True)
@@ -317,12 +415,11 @@ def train_one(
             vl = 0.0
             vn = 0
             with torch.no_grad():
-                for sx, ty, s_id, t_id in val_loader:
+                for sx, ty, s_id, t_id, _idx in val_loader:
                     sx, ty = sx.to(DEVICE), ty.to(DEVICE)
                     s_id, t_id = s_id.to(DEVICE), t_id.to(DEVICE)
                     pred = sx + model(sx, s_id, t_id)
-                    l = F.mse_loss(pred, ty, reduction="mean")
-                    vl += l.item() * sx.size(0)
+                    vl += F.mse_loss(pred, ty, reduction="mean").item() * sx.size(0)
                     vn += sx.size(0)
             vl /= max(1, vn)
             improved = vl < best_val - 1e-6
@@ -337,7 +434,6 @@ def train_one(
                 best_val = vl
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
-            # No val: keep final model weights
             if ep == 1 or ep % 10 == 0 or ep == epochs:
                 print(
                     f"[{arch} seed={seed}] Ep {ep:3d}  lr={opt.param_groups[0]['lr']:.2e}  "
@@ -349,21 +445,22 @@ def train_one(
     model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()})
     model.eval()
 
-    preds_te = []
-    preds_val = []
-    with torch.no_grad():
-        for sx, _ty, s_id, t_id in test_loader:
-            sx = sx.to(DEVICE)
-            s_id, t_id = s_id.to(DEVICE), t_id.to(DEVICE)
-            preds_te.append((sx + model(sx, s_id, t_id)).cpu().numpy())
-        if val_loader is not None:
-            for sx, _ty, s_id, t_id in val_loader:
+    # ------- Deterministic inference (no emb dropout) + TTA mean --------
+    def predict(loader, tta_passes=1, tta_drop=0.0):
+        preds = []
+        with torch.no_grad():
+            for sx, _ty, s_id, t_id, _idx in loader:
                 sx = sx.to(DEVICE)
                 s_id, t_id = s_id.to(DEVICE), t_id.to(DEVICE)
-                preds_val.append((sx + model(sx, s_id, t_id)).cpu().numpy())
+                accum = sx + model(sx, s_id, t_id)
+                for _ in range(tta_passes - 1):
+                    accum = accum + (sx + model(sx, s_id, t_id, force_emb_drop=tta_drop))
+                accum = accum / tta_passes
+                preds.append(accum.cpu().numpy())
+        return np.concatenate(preds, axis=0)
 
-    preds_te = np.concatenate(preds_te, axis=0)
-    preds_val = np.concatenate(preds_val, axis=0) if preds_val else None
+    preds_te = predict(test_loader, tta_passes=4, tta_drop=0.05)
+    preds_val = predict(val_loader, tta_passes=4, tta_drop=0.05) if val_loader is not None else None
     return preds_te, preds_val, best_val
 
 
@@ -397,26 +494,17 @@ def main():
     n_stations = len(stations)
     print(f"Stations: {stations}")
 
-    # Climate means per station
     climate = compute_station_climate(train_df, stn_to_id)
-    print("Climate means per station:")
-    for s, cid in stn_to_id.items():
-        print(f"  {s}: temp={climate[cid,0]:.2f}, dp={climate[cid,1]:.2f}, ws={climate[cid,2]:.2f}")
-
-    # Global std of anomalies (per variable)
     anom_std = compute_anomaly_std(train_df, stn_to_id, climate)
     print(f"Anomaly std per var: {anom_std}")
 
-    # Build arrays
     Xsrc = reshape_wide_to_series(train_df, "source")
     Ytgt = reshape_wide_to_series(train_df, "target")
     s_ids = np.array([stn_to_id[s] for s in train_df["source_city"]], dtype=np.int64)
     t_ids = np.array([stn_to_id[s] for s in train_df["target_city"]], dtype=np.int64)
 
-    # Anomalies
     src_anom = Xsrc - climate[s_ids][:, None, :]
     tgt_anom = Ytgt - climate[t_ids][:, None, :]
-    # Normalised
     src_anom_n = (src_anom / (anom_std + 1e-6)).astype(np.float32)
     tgt_anom_n = (tgt_anom / (anom_std + 1e-6)).astype(np.float32)
 
@@ -425,7 +513,6 @@ def main():
     t_ids_te = np.array([stn_to_id[s] for s in test_df["target_city"]], dtype=np.int64)
     src_anom_te = ((Xte - climate[s_ids_te][:, None, :]) / (anom_std + 1e-6)).astype(np.float32)
 
-    # Pair-stratified 10% val split
     SEED0 = 1337
     set_seed(SEED0)
     rng = np.random.default_rng(SEED0)
@@ -447,72 +534,63 @@ def main():
     ref_var = float(Ytgt.var())
     print(f"Ref var (proxy): {ref_var:.3f}")
 
-    # Ensemble specification - LSTM-only.
-    # v5 experiment showed the climate-centered LSTM is far stronger than
-    # the Transformer variant (anomaly-space val MSE ~0.135 vs ~0.306);
-    # mixing the TFM in at equal weight actually *lowered* the ensemble val
-    # score (0.8335 -> 0.8263), so we stick with LSTMs and add extra seeds.
+    # Ensemble: 6 LSTM seeds with different emb_dropout/mixup settings for
+    # diversity, plus 2 TCN seeds.
     models_spec = [
-        ("lstm", 1337),
-        ("lstm", 2024),
-        ("lstm", 4242),
-        ("lstm", 777),
-        ("lstm", 31337),
-        ("lstm", 2718),
+        ("lstm", 1337,  0.10, 0.4),
+        ("lstm", 2024,  0.10, 0.4),
+        ("lstm", 4242,  0.15, 0.3),
+        ("lstm",  777,  0.05, 0.4),
+        ("lstm", 31337, 0.10, 0.5),
+        ("lstm", 2718,  0.15, 0.2),
+        ("tcn",   1337, 0.10, 0.3),
+        ("tcn",   4242, 0.10, 0.4),
     ]
 
     preds_test_all = []
     preds_val_all = []
     val_best_list = []
-
     Yv = Ytgt[val_mask]
     t_ids_val = t_ids[val_mask]
 
-    for arch, seed in models_spec:
+    for arch, seed, emb_do, mix_a in models_spec:
         pt, pv, bv = train_one(
-            seed, arch, train_ds, val_ds, test_ds, n_stations, epochs=100
+            seed, arch, train_ds, val_ds, test_ds, n_stations,
+            epochs=120, emb_dropout=emb_do, mixup_alpha=mix_a,
         )
         preds_test_all.append(pt)
         preds_val_all.append(pv)
         val_best_list.append((arch, seed, bv))
         print(f"[{arch} seed={seed}] best val MSE (anomaly-norm): {bv:.5f}", flush=True)
 
-        # ---- Save a partial-ensemble submission after EACH model so we
-        # never lose progress to a crash or interruption. ----
-        _partial_test_n = np.mean(preds_test_all, axis=0)
-        _partial_test = _partial_test_n * anom_std + climate[t_ids_te][:, None, :]
-        _partial_val_n = np.mean(preds_val_all, axis=0)
-        _partial_val = _partial_val_n * anom_std + climate[t_ids_val][:, None, :]
+        # Save partial-ensemble submission after each model (crash-safe).
+        _pt_n = np.mean(preds_test_all, axis=0)
+        _pv_n = np.mean(preds_val_all, axis=0)
+        _pt = _pt_n * anom_std + climate[t_ids_te][:, None, :]
+        _pv = _pv_n * anom_std + climate[t_ids_val][:, None, :]
         _limits = {"temp": (-45.0, 55.0), "dewpoint": (-50.0, 35.0), "wind_speed": (0.0, 35.0)}
         for vi, v in enumerate(VARS):
             lo, hi = _limits[v]
-            _partial_test[..., vi] = np.clip(_partial_test[..., vi], lo, hi)
-            _partial_val[..., vi] = np.clip(_partial_val[..., vi], lo, hi)
-        _mse = float(((_partial_val - Yv) ** 2).mean())
+            _pt[..., vi] = np.clip(_pt[..., vi], lo, hi)
+            _pv[..., vi] = np.clip(_pv[..., vi], lo, hi)
+        _mse = float(((_pv - Yv) ** 2).mean())
         _nrmse = math.sqrt(_mse) / math.sqrt(ref_var)
         _score = max(0.0, 1.0 - _nrmse)
         print(f"  >> partial ensemble ({len(preds_test_all)} models) val score: {_score:.4f}", flush=True)
-        write_submission(test_df, _partial_test, OUT_PATH)
+        write_submission(test_df, _pt, OUT_PATH)
 
+    # Final ensemble
     preds_test_n = np.mean(preds_test_all, axis=0)
     preds_val_n = np.mean(preds_val_all, axis=0)
+    preds_test = preds_test_n * anom_std + climate[t_ids_te][:, None, :]
+    preds_val  = preds_val_n  * anom_std + climate[t_ids_val][:, None, :]
 
-    # Denormalise: anom_norm -> anom -> add target climate
-    preds_test = preds_test_n * anom_std + climate[s_ids_te][:, None, :]  # will fix below
-    # Careful: we need target climate (t_ids), not s_ids. Recompute.
-    preds_test = preds_test_n * anom_std
-    preds_test = preds_test + climate[t_ids_te][:, None, :]
-
-    preds_val = preds_val_n * anom_std + climate[t_ids[val_mask]][:, None, :]
-
-    # Physical clipping
     limits = {"temp": (-45.0, 55.0), "dewpoint": (-50.0, 35.0), "wind_speed": (0.0, 35.0)}
     for vi, v in enumerate(VARS):
         lo, hi = limits[v]
         preds_test[..., vi] = np.clip(preds_test[..., vi], lo, hi)
         preds_val[..., vi] = np.clip(preds_val[..., vi], lo, hi)
 
-    Yv = Ytgt[val_mask]
     mse = float(((preds_val - Yv) ** 2).mean())
     nrmse = math.sqrt(mse) / math.sqrt(ref_var)
     score_est = max(0.0, 1.0 - nrmse)
