@@ -53,8 +53,20 @@ Each folder snapshots a working `solution.py` + its `submission.csv`:
 | v1      | Single 4-layer Transformer with separate src/tgt station embeddings          | 0.706     | 0.60       |
 | v2      | Variance-weighted loss + EMA (worse — kept for reference)                    | 0.663     | -          |
 | v3      | 5-seed Transformer ensemble                                                  | 0.741     | -          |
-| v4      | Heterogeneous ensemble (5 Transformer + 3 BiLSTM)                            | **0.790** | -          |
-| v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer)               | 0.834+    | -          |
+| v4      | Heterogeneous ensemble (5 Transformer + 3 BiLSTM)                            | 0.790     | -          |
+| v5      | Climate-anomaly BiLSTM ensemble (6 LSTM seeds, no Transformer, Colab A100)   | **0.8355**| -          |
+
+### v5 breakdown (Colab, all 6 seeds)
+
+```
+Val MSE raw:  2.8061
+Val nRMSE:    0.1645
+Val score:    0.8355
+
+Per-variable MSE:   temp 3.41    dewpoint 3.96    wind_speed 1.05
+Per-seed anom-norm val MSE: 1337=0.1378  2024=0.1352  4242=0.1308
+                            777=0.1350  31337=0.1398  2718=0.1351
+```
 
 The ~10-point val→test gap on v1 highlighted the two unseen station pairs as
 the dominant failure mode, which is what v5's climate-anomaly decomposition
