@@ -528,32 +528,82 @@ def main():
         print(f"  >> partial ensemble ({len(preds_test_all)} models) val score: {_score:.4f}", flush=True)
         write_submission(test_df, _pt, OUT_PATH)
 
-    # Final ensemble
-    preds_test_n = np.mean(preds_test_all, axis=0)
-    preds_val_n = np.mean(preds_val_all, axis=0)
-    preds_test = preds_test_n * anom_std + climate[t_ids_te][:, None, :]
-    preds_val  = preds_val_n  * anom_std + climate[t_ids_val][:, None, :]
-
-    limits = {"temp": (-45.0, 55.0), "dewpoint": (-50.0, 35.0), "wind_speed": (0.0, 35.0)}
-    for vi, v in enumerate(VARS):
-        lo, hi = limits[v]
-        preds_test[..., vi] = np.clip(preds_test[..., vi], lo, hi)
-        preds_val[..., vi] = np.clip(preds_val[..., vi], lo, hi)
-
-    mse = float(((preds_val - Yv) ** 2).mean())
-    nrmse = math.sqrt(mse) / math.sqrt(ref_var)
-    score_est = max(0.0, 1.0 - nrmse)
-    print("\n===== Ensemble validation estimate =====")
+    print("\n===== Per-seed best val MSE (anomaly-norm) =====")
     for rnn_type, seed, pd_, bv in val_best_list:
-        print(f"  [{rnn_type} seed={seed} pd={pd_}] best val (anomaly-norm MSE): {bv:.4f}")
-    print(f"Val MSE raw: {mse:.4f}")
-    print(f"Val nRMSE:   {nrmse:.4f}")
-    print(f"Val score:   {score_est:.4f}")
-    for vi, v in enumerate(VARS):
-        mse_v = float(((preds_val[..., vi] - Yv[..., vi]) ** 2).mean())
-        print(f"  {v}: MSE = {mse_v:.4f}")
+        print(f"  [{rnn_type} seed={seed} pd={pd_}] {bv:.4f}")
 
-    write_submission(test_df, preds_test, OUT_PATH)
+    # ---- Build several named subset ensembles and report val score for
+    # each. The platform auto-picks the HIGHEST public-score submission
+    # to represent us on the private leaderboard — so we ship the subset
+    # with the best val (the proxy for public) and accept that extra
+    # robustness in lower-val subsets is effectively wasted unless it
+    # also helps public.
+    limits = {"temp": (-45.0, 55.0), "dewpoint": (-50.0, 35.0), "wind_speed": (0.0, 35.0)}
+    idx = {(rt, seed, pd_): i for i, (rt, seed, pd_) in enumerate(
+        [(a, b, c) for (a, b, c, _bv) in val_best_list]
+    )}
+
+    def build_sub(name, member_keys):
+        ii = [idx[k] for k in member_keys if k in idx]
+        if not ii:
+            return None
+        pt_n = np.mean([preds_test_all[i] for i in ii], axis=0)
+        pv_n = np.mean([preds_val_all[i]  for i in ii], axis=0)
+        pt = pt_n * anom_std + climate[t_ids_te][:, None, :]
+        pv = pv_n * anom_std + climate[t_ids_val][:, None, :]
+        for vi, v in enumerate(VARS):
+            lo, hi = limits[v]
+            pt[..., vi] = np.clip(pt[..., vi], lo, hi)
+            pv[..., vi] = np.clip(pv[..., vi], lo, hi)
+        mse_ = float(((pv - Yv) ** 2).mean())
+        nrmse_ = math.sqrt(mse_) / math.sqrt(ref_var)
+        score_ = max(0.0, 1.0 - nrmse_)
+        per_var = [float(((pv[..., vi] - Yv[..., vi]) ** 2).mean()) for vi in range(N_VARS)]
+        return {
+            "name": name, "pt": pt, "mse": mse_, "nrmse": nrmse_, "score": score_,
+            "per_var": per_var, "n_models": len(ii),
+        }
+
+    subsets = {
+        "core":        [("lstm", s, 0.0) for s in (1337, 2024, 4242, 777, 31337)],
+        "diverse":     [("lstm", s, 0.0) for s in (1337, 2024, 4242, 777, 31337)]
+                     + [("gru",  2718, 0.0)],
+        "regularized": [("lstm", s, 0.0) for s in (1337, 2024, 4242, 777, 31337)]
+                     + [("gru",  2718, 0.0),
+                        ("lstm", 1337, 0.3), ("lstm", 2718, 0.5)],
+        "robust":      [("lstm", s, 0.0) for s in (1337, 2024, 4242, 777, 31337)]
+                     + [("gru",  2718, 0.0),
+                        ("lstm", 1337, 0.3), ("lstm", 2718, 0.5),
+                        ("lstm", 1337, 1.0), ("lstm", 4242, 1.0)],
+    }
+    results = {}
+    for name, keys in subsets.items():
+        r = build_sub(name, keys)
+        if r is None:
+            continue
+        results[name] = r
+        print(f"\n===== Subset '{name}' ({r['n_models']} models) =====")
+        print(f"  Val MSE raw:  {r['mse']:.4f}")
+        print(f"  Val nRMSE:    {r['nrmse']:.4f}")
+        print(f"  Val score:    {r['score']:.4f}")
+        for vi, v in enumerate(VARS):
+            print(f"    {v}: MSE = {r['per_var'][vi]:.4f}")
+
+    # Write a separate submission for each subset so the user can pick.
+    for name, r in results.items():
+        path = os.path.join(OUT_DIR, f"submission_{name}.csv")
+        write_submission(test_df, r["pt"], path)
+
+    # The "default" submission.csv is the subset with the best val score —
+    # since the platform auto-picks the highest public-score submission,
+    # we default to our best val-score predictor.
+    best_name = max(results, key=lambda k: results[k]["score"])
+    print(f"\n===== Recommended submission: '{best_name}' (best val score) =====")
+    write_submission(test_df, results[best_name]["pt"], OUT_PATH)
+    print(
+        "(Also written as submission_{core,diverse,regularized,robust}.csv in "
+        f"{OUT_DIR}/ so you can submit alternative subsets too.)"
+    )
 
 
 if __name__ == "__main__":
