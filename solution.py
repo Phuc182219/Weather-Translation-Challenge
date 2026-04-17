@@ -182,16 +182,20 @@ def sinusoidal_time_feats(T: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# BiLSTM model with *coupled* pair-dropout
+# Recurrent translator with *coupled* pair-dropout
 # ---------------------------------------------------------------------------
-class BiLSTMTranslator(nn.Module):
-    """A BiLSTM translator. If `pair_dropout > 0`, during training we
-    replace BOTH the source and target station embeddings with learned
-    "null" vectors for a random fraction of samples — simulating an
-    unseen station pair. The model therefore learns to produce reasonable
-    predictions using only the climate-anomaly features + time features,
-    and at test time on an unseen pair behaves similarly to what it has
-    seen during training.
+class RecurrentTranslator(nn.Module):
+    """A bidirectional recurrent translator (LSTM or GRU). If
+    `pair_dropout > 0`, during training we replace BOTH the source and
+    target station embeddings with learned "null" vectors for a random
+    fraction of samples — simulating an unseen station pair. The model
+    therefore learns to produce reasonable predictions using only the
+    climate-anomaly features + time features, and at test time on an
+    unseen pair behaves similarly to what it has seen during training.
+
+    If `pair_dropout >= 1.0`, both embeddings are ALWAYS replaced with
+    the null vectors, even at eval time — producing a "pair-agnostic"
+    model with no capacity to memorise pair-specific behaviour.
     """
 
     def __init__(
@@ -202,6 +206,7 @@ class BiLSTMTranslator(nn.Module):
         dropout=0.2,
         station_dim=48,
         pair_dropout=0.0,
+        rnn_type="lstm",
     ):
         super().__init__()
         self.src_station_emb = nn.Embedding(n_stations, station_dim)
@@ -211,10 +216,12 @@ class BiLSTMTranslator(nn.Module):
         nn.init.trunc_normal_(self.null_src_emb, std=0.02)
         nn.init.trunc_normal_(self.null_tgt_emb, std=0.02)
         self.pair_dropout = pair_dropout
+        self.rnn_type = rnn_type
 
         in_feats = N_VARS + 4 + 2 * station_dim
         self.input_proj = nn.Linear(in_feats, d_model)
-        self.rnn = nn.LSTM(
+        rnn_cls = {"lstm": nn.LSTM, "gru": nn.GRU}[rnn_type]
+        self.rnn = rnn_cls(
             input_size=d_model, hidden_size=d_model, num_layers=n_layers,
             dropout=dropout if n_layers > 1 else 0.0,
             bidirectional=True, batch_first=True,
@@ -255,6 +262,10 @@ class BiLSTMTranslator(nn.Module):
         return self.head(h)
 
 
+# Back-compat alias (v5/v6 imported BiLSTMTranslator)
+BiLSTMTranslator = RecurrentTranslator
+
+
 # ---------------------------------------------------------------------------
 # Training one model
 # ---------------------------------------------------------------------------
@@ -266,6 +277,7 @@ def train_one(
     n_stations,
     epochs=120,
     pair_dropout=0.0,
+    rnn_type="lstm",
 ):
     set_seed(seed)
     BATCH = 128
@@ -273,9 +285,12 @@ def train_one(
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=0) if val_ds is not None else None
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
 
-    model = BiLSTMTranslator(n_stations=n_stations, pair_dropout=pair_dropout).to(DEVICE)
+    model = RecurrentTranslator(
+        n_stations=n_stations, pair_dropout=pair_dropout, rnn_type=rnn_type
+    ).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[seed={seed} pair_dropout={pair_dropout}] Model params: {n_params:,}", flush=True)
+    print(f"[{rnn_type} seed={seed} pair_dropout={pair_dropout}] "
+          f"Model params: {n_params:,}", flush=True)
 
     LR = 2e-3
     WD = 1e-4
@@ -335,7 +350,7 @@ def train_one(
             flag = "*" if improved else " "
             if ep == 1 or ep % 10 == 0 or improved:
                 print(
-                    f"[seed={seed} pd={pair_dropout}] Ep {ep:3d}  "
+                    f"[{rnn_type} seed={seed} pd={pair_dropout}] Ep {ep:3d}  "
                     f"lr={opt.param_groups[0]['lr']:.2e}  "
                     f"train={tr_loss:.4f}  val={vl:.4f} {flag}  "
                     f"elapsed={time.time()-t0:.1f}s",
@@ -347,7 +362,7 @@ def train_one(
         else:
             if ep == 1 or ep % 10 == 0 or ep == epochs:
                 print(
-                    f"[seed={seed} pd={pair_dropout}] Ep {ep:3d}  "
+                    f"[{rnn_type} seed={seed} pd={pair_dropout}] Ep {ep:3d}  "
                     f"lr={opt.param_groups[0]['lr']:.2e}  train={tr_loss:.4f}  "
                     f"elapsed={time.time()-t0:.1f}s",
                     flush=True,
@@ -463,17 +478,21 @@ def main():
     # this yields a predictor that stays near v5 on seen pairs while
     # anchoring unseen pairs to the pair-agnostic prior.
     models_spec = [
-        # (seed, pair_dropout)
-        (1337,  0.0),
-        (2024,  0.0),
-        (4242,  0.0),
-        ( 777,  0.0),
-        (31337, 0.0),
-        (1337,  0.3),
-        (4242,  0.3),
-        (2718,  0.5),
-        (1337,  1.0),   # pair-agnostic, all-null emb
-        (4242,  1.0),   # pair-agnostic, all-null emb
+        # (rnn_type, seed, pair_dropout)
+        # 5 v5-style BiLSTM experts (strongest on seen pairs)
+        ("lstm", 1337,  0.0),
+        ("lstm", 2024,  0.0),
+        ("lstm", 4242,  0.0),
+        ("lstm",  777,  0.0),
+        ("lstm", 31337, 0.0),
+        # 1 BiGRU seed for architectural diversity
+        ("gru",  2718,  0.0),
+        # 2 coupled pair-dropout generalists
+        ("lstm", 1337,  0.3),
+        ("lstm", 2718,  0.5),
+        # 2 pair-agnostic (always-null-emb) robustness anchors
+        ("lstm", 1337,  1.0),
+        ("lstm", 4242,  1.0),
     ]
 
     preds_test_all = []
@@ -482,15 +501,16 @@ def main():
     Yv = Ytgt[val_mask]
     t_ids_val = t_ids[val_mask]
 
-    for seed, pd_ in models_spec:
+    for rnn_type, seed, pd_ in models_spec:
         pt, pv, bv = train_one(
             seed, train_ds, val_ds, test_ds, n_stations,
-            epochs=120, pair_dropout=pd_,
+            epochs=120, pair_dropout=pd_, rnn_type=rnn_type,
         )
         preds_test_all.append(pt)
         preds_val_all.append(pv)
-        val_best_list.append((seed, pd_, bv))
-        print(f"[seed={seed} pd={pd_}] best val MSE (anomaly-norm): {bv:.5f}", flush=True)
+        val_best_list.append((rnn_type, seed, pd_, bv))
+        print(f"[{rnn_type} seed={seed} pd={pd_}] best val MSE (anomaly-norm): {bv:.5f}",
+              flush=True)
 
         # Partial-ensemble save after each model (crash-safe).
         _pt_n = np.mean(preds_test_all, axis=0)
@@ -524,8 +544,8 @@ def main():
     nrmse = math.sqrt(mse) / math.sqrt(ref_var)
     score_est = max(0.0, 1.0 - nrmse)
     print("\n===== Ensemble validation estimate =====")
-    for seed, pd_, bv in val_best_list:
-        print(f"  [seed={seed} pd={pd_}] best val (anomaly-norm MSE): {bv:.4f}")
+    for rnn_type, seed, pd_, bv in val_best_list:
+        print(f"  [{rnn_type} seed={seed} pd={pd_}] best val (anomaly-norm MSE): {bv:.4f}")
     print(f"Val MSE raw: {mse:.4f}")
     print(f"Val nRMSE:   {nrmse:.4f}")
     print(f"Val score:   {score_est:.4f}")
